@@ -49,14 +49,15 @@ pub trait Tweakable: Sized {
 
 #[cfg(any(debug_assertions, feature = "release_tweak"))]
 mod itweak {
+    use super::Tweakable;
     use lazy_static::*;
     use std::any::Any;
     use std::collections::{HashMap, HashSet};
     use std::fs::File;
     use std::io::{BufRead, BufReader};
+    use std::path::Path;
     use std::sync::Mutex;
     use std::time::{Instant, SystemTime};
-    use super::Tweakable;
 
     macro_rules! impl_tweakable {
         ($($t: ty) +) => {
@@ -74,7 +75,9 @@ mod itweak {
 
     impl Tweakable for &'static str {
         fn parse(x: &str) -> Option<Self> {
-            Some(Box::leak(Box::new(String::from(x.trim_start_matches('"').trim_end_matches('"')))))
+            Some(Box::leak(Box::new(String::from(
+                x.trim_start_matches('"').trim_end_matches('"'),
+            ))))
         }
     }
 
@@ -98,22 +101,47 @@ mod itweak {
         static ref WATCHERS: Mutex<HashMap<&'static str, FileWatcher>> = Default::default();
     }
 
-    fn last_modified(file: &'static str) -> Option<SystemTime> {
-        File::open(file).ok()?.metadata().ok()?.modified().ok()
+    fn try_open(file: &'static str) -> std::io::Result<File> {
+        let p: &Path = file.as_ref();
+        if let Some(x) = File::open(p).ok() {
+            return Ok(x);
+        }
+        let p: &Path = p
+            .strip_prefix(p.iter().next().ok_or(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "path is empty",
+            ))?)
+            .map_err(|e| std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e,
+            ))?;
+        File::open(&p)
+    }
+
+    fn last_modified(file: &File) -> Option<SystemTime> {
+        file.metadata().ok()?.modified().ok()
     }
 
     // Assume that the first time a tweak! is called, all tweak!s will be in original position.
-    fn parse_tweaks(file: &'static str) -> Option<()> {
+    fn parse_tweaks(fpath: &'static str) -> Option<()> {
         let mut fileinfos = PARSED_FILES.lock().unwrap();
 
-        if !fileinfos.contains(&file) {
+        if !fileinfos.contains(&fpath) {
             let mut values = VALUES.lock().unwrap();
 
-            let file_modified = last_modified(file).unwrap_or_else(SystemTime::now);
+            let file = match try_open(fpath) {
+                Ok(x) => x,
+                Err(e) => {
+                    eprintln!("[inline-tweak] couldn't open file for tweaking: {}\n do you have the access rights? are you running this from the workspace root?", e);
+                    return None;
+                }
+            };
+
+            let file_modified = last_modified(&file).unwrap_or_else(SystemTime::now);
             let now = Instant::now();
 
             let mut tweaks_seen = 0;
-            for (line_n, line) in BufReader::new(File::open(file).ok()?)
+            for (line_n, line) in BufReader::new(file)
                 .lines()
                 .filter_map(|line| line.ok())
                 .enumerate()
@@ -125,7 +153,7 @@ mod itweak {
                         .unwrap_or(0);
 
                     values.insert(
-                        (file, line_n as u32 + 1, path_corrected_column as u32 + 1),
+                        (fpath, line_n as u32 + 1, path_corrected_column as u32 + 1),
                         TweakValue {
                             position: tweaks_seen,
                             value: None,
@@ -138,7 +166,7 @@ mod itweak {
                 }
             }
 
-            fileinfos.insert(file);
+            fileinfos.insert(fpath);
         }
 
         Some(())
@@ -146,18 +174,19 @@ mod itweak {
 
     fn update_tweak<T: 'static + Tweakable + Clone + Send>(
         tweak: &mut TweakValue,
-        file: &'static str,
+        fpath: &'static str,
     ) -> Option<()> {
-        let last_modified = last_modified(file)?;
+        let file = try_open(fpath).ok()?;
+        let last_modified = last_modified(&file)?;
         if tweak.value.is_none()
             || last_modified
-                .duration_since(tweak.file_modified)
-                .ok()?
-                .as_secs_f32()
-                > 0.5
+            .duration_since(tweak.file_modified)
+            .ok()?
+            .as_secs_f32()
+            > 0.5
         {
             let mut tweaks_seen = 0;
-            let line_str = BufReader::new(File::open(file).ok()?)
+            let line_str = BufReader::new(&file)
                 .lines()
                 .filter_map(|line| line.ok())
                 .find(|line| {
@@ -170,7 +199,7 @@ mod itweak {
 
             // Find end of tweak
             let mut prec = 1;
-            let (end, _) = val_str.char_indices().find(|(_,c)| {
+            let (end, _) = val_str.char_indices().find(|(_, c)| {
                 match c {
                     ';' | ')' if prec == 1 => {
                         return true;
@@ -220,14 +249,17 @@ mod itweak {
 
         let now = Instant::now();
 
+        let last_modified = try_open(file)
+            .ok()
+            .and_then(|f| last_modified(&f))
+            .unwrap_or_else(SystemTime::now);
         let watcher = entry.or_insert_with(|| FileWatcher {
             last_checked: now,
-            file_modified: last_modified(file).unwrap_or_else(SystemTime::now),
+            file_modified: last_modified,
         });
 
         watcher.last_checked = now;
 
-        let last_modified = last_modified(file).unwrap_or_else(SystemTime::now);
         last_modified
             .duration_since(watcher.file_modified)
             .map(|time| {
